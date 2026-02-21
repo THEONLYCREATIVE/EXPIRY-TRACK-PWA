@@ -1,37 +1,43 @@
 /**
- * Expiry Tracker v5.0.0
- * Modern PWA for pharmacy expiry tracking
- * Features: GS1 parsing, GTIN-RMS matching, camera scanner, auto-save
+ * EXPIRY TRACKER v5.2.0
+ * Complete Pharmacy Expiry Tracking PWA
+ * Features: GS1 Parser, GTIN-RMS Matching, API Lookup, Bulk Processing, Camera Scanner
  * By VYSAKH
  */
 
-// ========================================
+// ============================================
 // CONFIGURATION
-// ========================================
+// ============================================
 const CONFIG = {
   DB_NAME: 'ExpiryTrackerDB',
-  DB_VERSION: 1,
-  EXPIRY_SOON_DAYS: 90
+  DB_VERSION: 2,
+  EXPIRY_SOON_DAYS: 90,
+  VERSION: '5.2.0'
 };
 
-// ========================================
-// STATE
-// ========================================
-const State = {
+// ============================================
+// APPLICATION STATE
+// ============================================
+const App = {
   db: null,
   masterIndex: new Map(),
   masterRMS: new Map(),
-  scannerActive: false,
-  html5QrCode: null,
-  cameras: [],
-  currentCamera: 0,
-  currentFilter: 'all',
-  searchQuery: ''
+  settings: {
+    apiEnabled: true
+  },
+  scanner: {
+    active: false,
+    instance: null,
+    cameras: [],
+    currentCamera: 0
+  },
+  filter: 'all',
+  search: ''
 };
 
-// ========================================
-// DATABASE
-// ========================================
+// ============================================
+// DATABASE LAYER
+// ============================================
 const DB = {
   async init() {
     return new Promise((resolve, reject) => {
@@ -40,327 +46,413 @@ const DB = {
       request.onerror = () => reject(request.error);
       
       request.onsuccess = () => {
-        State.db = request.result;
+        App.db = request.result;
+        console.log('✅ Database ready');
         resolve();
       };
       
       request.onupgradeneeded = (e) => {
         const db = e.target.result;
         
+        // History store
         if (!db.objectStoreNames.contains('history')) {
-          const store = db.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
-          store.createIndex('gtin', 'gtin', { unique: false });
-          store.createIndex('timestamp', 'timestamp', { unique: false });
+          const historyStore = db.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
+          historyStore.createIndex('gtin', 'gtin', { unique: false });
+          historyStore.createIndex('timestamp', 'timestamp', { unique: false });
         }
         
+        // Master store
         if (!db.objectStoreNames.contains('master')) {
-          const store = db.createObjectStore('master', { keyPath: 'barcode' });
-          store.createIndex('name', 'name', { unique: false });
+          const masterStore = db.createObjectStore('master', { keyPath: 'barcode' });
+          masterStore.createIndex('name', 'name', { unique: false });
         }
+        
+        // Settings store
+        if (!db.objectStoreNames.contains('settings')) {
+          db.createObjectStore('settings', { keyPath: 'key' });
+        }
+        
+        console.log('📦 Database upgraded');
       };
     });
   },
-  
+
+  // Generic transaction helper
+  async _tx(store, mode, fn) {
+    return new Promise((resolve, reject) => {
+      const tx = App.db.transaction(store, mode);
+      const s = tx.objectStore(store);
+      const result = fn(s);
+      if (result && result.onsuccess !== undefined) {
+        result.onsuccess = () => resolve(result.result);
+        result.onerror = () => reject(result.error);
+      } else {
+        tx.oncomplete = () => resolve(result);
+        tx.onerror = () => reject(tx.error);
+      }
+    });
+  },
+
   // History operations
   async addHistory(item) {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('history', 'readwrite');
-      const store = tx.objectStore('history');
-      const request = store.add(item);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('history', 'readwrite', s => s.add(item));
   },
-  
+
   async updateHistory(item) {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('history', 'readwrite');
-      const store = tx.objectStore('history');
-      const request = store.put(item);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('history', 'readwrite', s => s.put(item));
   },
-  
+
   async getHistory(id) {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('history', 'readonly');
-      const store = tx.objectStore('history');
-      const request = store.get(id);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('history', 'readonly', s => s.get(id));
   },
-  
+
   async getAllHistory() {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('history', 'readonly');
-      const store = tx.objectStore('history');
-      const request = store.getAll();
-      request.onsuccess = () => resolve(request.result || []);
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('history', 'readonly', s => s.getAll());
   },
-  
+
   async deleteHistory(id) {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('history', 'readwrite');
-      const store = tx.objectStore('history');
-      const request = store.delete(id);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('history', 'readwrite', s => s.delete(id));
   },
-  
+
   async clearHistory() {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('history', 'readwrite');
-      const store = tx.objectStore('history');
-      const request = store.clear();
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('history', 'readwrite', s => s.clear());
   },
-  
+
   // Master operations
   async addMaster(item) {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('master', 'readwrite');
-      const store = tx.objectStore('master');
-      const request = store.put(item);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('master', 'readwrite', s => s.put(item));
   },
-  
+
   async getAllMaster() {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('master', 'readonly');
-      const store = tx.objectStore('master');
-      const request = store.getAll();
-      request.onsuccess = () => resolve(request.result || []);
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('master', 'readonly', s => s.getAll());
   },
-  
+
   async clearMaster() {
-    return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('master', 'readwrite');
-      const store = tx.objectStore('master');
-      const request = store.clear();
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    return this._tx('master', 'readwrite', s => s.clear());
   },
-  
+
   async bulkAddMaster(items) {
     return new Promise((resolve, reject) => {
-      const tx = State.db.transaction('master', 'readwrite');
+      const tx = App.db.transaction('master', 'readwrite');
       const store = tx.objectStore('master');
       let count = 0;
       
       for (const item of items) {
-        store.put(item);
-        count++;
+        if (item.barcode) {
+          store.put(item);
+          count++;
+        }
       }
       
       tx.oncomplete = () => resolve(count);
       tx.onerror = () => reject(tx.error);
     });
+  },
+
+  // Settings
+  async getSetting(key, defaultValue = null) {
+    try {
+      const result = await this._tx('settings', 'readonly', s => s.get(key));
+      return result ? result.value : defaultValue;
+    } catch {
+      return defaultValue;
+    }
+  },
+
+  async setSetting(key, value) {
+    return this._tx('settings', 'readwrite', s => s.put({ key, value }));
   }
 };
 
-// ========================================
-// GS1 PARSER
-// ========================================
-function parseGS1(code) {
-  const result = {
-    raw: code,
-    gtin: '',
-    expiry: '',
-    expiryISO: '',
-    expiryDisplay: '',
-    batch: '',
-    serial: '',
-    qty: 1
-  };
-  
-  if (!code) return result;
-  
-  code = code.trim().replace(/[\r\n]/g, '');
-  
-  // Check for GS1 format
-  const hasAI = code.includes('(') || /^01\d{14}/.test(code);
-  
-  if (!hasAI) {
-    // Plain barcode
-    const digits = code.replace(/\D/g, '');
-    if (digits.length >= 8) {
-      result.gtin = digits.padStart(14, '0');
+// ============================================
+// GS1 BARCODE PARSER
+// ============================================
+const GS1 = {
+  parse(code) {
+    const result = {
+      raw: code || '',
+      gtin: '',
+      expiry: '',
+      expiryISO: '',
+      expiryDisplay: '',
+      batch: '',
+      serial: '',
+      qty: 1,
+      isGS1: false
+    };
+
+    if (!code || typeof code !== 'string') return result;
+
+    code = code.trim().replace(/[\r\n\t]/g, '');
+
+    // Check for GS1 format (contains AIs)
+    const hasAI = code.includes('(') || /^01\d{14}/.test(code);
+
+    if (!hasAI) {
+      // Plain barcode
+      const digits = code.replace(/\D/g, '');
+      if (digits.length >= 8 && digits.length <= 14) {
+        result.gtin = digits.padStart(14, '0');
+      }
+      return result;
     }
+
+    result.isGS1 = true;
+
+    // Parse GTIN (01)
+    const gtinMatch = code.match(/\(01\)(\d{14})|^01(\d{14})/);
+    if (gtinMatch) {
+      result.gtin = gtinMatch[1] || gtinMatch[2];
+    }
+
+    // Parse Expiry (17)
+    const expiryMatch = code.match(/\(17\)(\d{6})|17(\d{6})/);
+    if (expiryMatch) {
+      const yymmdd = expiryMatch[1] || expiryMatch[2];
+      result.expiry = yymmdd;
+
+      const yy = parseInt(yymmdd.substring(0, 2));
+      const mm = parseInt(yymmdd.substring(2, 4));
+      let dd = parseInt(yymmdd.substring(4, 6));
+
+      const year = 2000 + yy;
+      if (dd === 0) dd = new Date(year, mm, 0).getDate();
+
+      result.expiryISO = `${year}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+      result.expiryDisplay = `${String(dd).padStart(2, '0')}/${String(mm).padStart(2, '0')}/${year}`;
+    }
+
+    // Parse Batch (10)
+    const batchMatch = code.match(/\(10\)([^\(]+)|10([A-Za-z0-9\-]+)/);
+    if (batchMatch) {
+      result.batch = (batchMatch[1] || batchMatch[2] || '').replace(/[^\w\-]/g, '').substring(0, 20);
+    }
+
+    // Parse Serial (21)
+    const serialMatch = code.match(/\(21\)([^\(]+)|21([A-Za-z0-9]+)/);
+    if (serialMatch) {
+      result.serial = (serialMatch[1] || serialMatch[2] || '').substring(0, 20);
+    }
+
     return result;
-  }
-  
-  // Parse GS1 AIs
-  // GTIN (01)
-  const gtinMatch = code.match(/\(01\)(\d{14})|01(\d{14})/);
-  if (gtinMatch) {
-    result.gtin = gtinMatch[1] || gtinMatch[2];
-  }
-  
-  // Expiry (17)
-  const expiryMatch = code.match(/\(17\)(\d{6})|17(\d{6})/);
-  if (expiryMatch) {
-    const yymmdd = expiryMatch[1] || expiryMatch[2];
-    result.expiry = yymmdd;
-    
-    const yy = parseInt(yymmdd.substring(0, 2));
-    const mm = parseInt(yymmdd.substring(2, 4));
-    let dd = parseInt(yymmdd.substring(4, 6));
-    
-    const year = 2000 + yy;
-    if (dd === 0) dd = new Date(year, mm, 0).getDate();
-    
-    result.expiryISO = `${year}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
-    result.expiryDisplay = `${String(dd).padStart(2, '0')}/${String(mm).padStart(2, '0')}/${year}`;
-  }
-  
-  // Batch (10)
-  const batchMatch = code.match(/\(10\)([^\(]+)|10([A-Za-z0-9]+)/);
-  if (batchMatch) {
-    result.batch = (batchMatch[1] || batchMatch[2] || '').trim();
-  }
-  
-  // Serial (21)
-  const serialMatch = code.match(/\(21\)([^\(]+)|21([A-Za-z0-9]+)/);
-  if (serialMatch) {
-    result.serial = (serialMatch[1] || serialMatch[2] || '').trim();
-  }
-  
-  return result;
-}
+  },
 
-function getExpiryStatus(expiryISO) {
-  if (!expiryISO) return 'unknown';
-  
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  
-  const expiry = new Date(expiryISO);
-  expiry.setHours(0, 0, 0, 0);
-  
-  const diffDays = Math.floor((expiry - today) / (1000 * 60 * 60 * 24));
-  
-  if (diffDays < 0) return 'expired';
-  if (diffDays <= CONFIG.EXPIRY_SOON_DAYS) return 'expiring';
-  return 'ok';
-}
+  getExpiryStatus(expiryISO) {
+    if (!expiryISO) return 'unknown';
 
-// ========================================
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const expiry = new Date(expiryISO);
+    expiry.setHours(0, 0, 0, 0);
+
+    const diffDays = Math.floor((expiry - today) / (1000 * 60 * 60 * 24));
+
+    if (diffDays < 0) return 'expired';
+    if (diffDays <= CONFIG.EXPIRY_SOON_DAYS) return 'expiring';
+    return 'ok';
+  }
+};
+
+// ============================================
 // PRODUCT MATCHING
-// ========================================
-function buildMasterIndex(masterData) {
-  State.masterIndex.clear();
-  State.masterRMS.clear();
-  
-  for (const item of masterData) {
-    const barcode = String(item.barcode || '').replace(/\D/g, '');
-    const name = item.name || '';
-    const rms = item.rms || '';
-    
-    if (!barcode) continue;
-    
-    // Exact match
-    State.masterIndex.set(barcode, name);
-    
-    // GTIN-14 padded
-    const gtin14 = barcode.padStart(14, '0');
-    State.masterIndex.set(gtin14, name);
-    
-    // GTIN-13 (without leading zero)
-    if (gtin14.startsWith('0')) {
-      State.masterIndex.set(gtin14.slice(1), name);
-    }
-    
-    // Last 8 digits
-    if (barcode.length >= 8) {
+// ============================================
+const Matcher = {
+  buildIndex(masterData) {
+    App.masterIndex.clear();
+    App.masterRMS.clear();
+
+    for (const item of masterData) {
+      const barcode = String(item.barcode || '').replace(/\D/g, '');
+      const name = item.name || '';
+      const rms = item.rms || '';
+
+      if (!barcode || barcode.length < 8) continue;
+
+      // Index by various formats
+      App.masterIndex.set(barcode, name);
+
+      const gtin14 = barcode.padStart(14, '0');
+      App.masterIndex.set(gtin14, name);
+
+      // GTIN-13 (without leading zero)
+      if (gtin14.startsWith('0')) {
+        App.masterIndex.set(gtin14.slice(1), name);
+      }
+
+      // Last 8 digits
       const last8 = barcode.slice(-8);
-      if (!State.masterIndex.has(last8)) {
-        State.masterIndex.set(last8, name);
+      if (!App.masterIndex.has(last8)) {
+        App.masterIndex.set(last8, name);
+      }
+
+      // RMS mapping
+      if (rms) {
+        App.masterRMS.set(barcode, rms);
+        App.masterRMS.set(gtin14, rms);
       }
     }
-    
-    // RMS mapping
-    if (rms) {
-      State.masterRMS.set(barcode, rms);
-      State.masterRMS.set(gtin14, rms);
+
+    console.log(`📋 Index built: ${App.masterIndex.size} entries`);
+  },
+
+  findProduct(gtin) {
+    if (!gtin) return { name: '', rms: '', matchType: 'NONE' };
+
+    // Exact match
+    if (App.masterIndex.has(gtin)) {
+      return {
+        name: App.masterIndex.get(gtin),
+        rms: App.masterRMS.get(gtin) || '',
+        matchType: 'EXACT'
+      };
     }
-  }
-}
 
-function matchProduct(gtin) {
-  if (!gtin) return { name: '', rms: '' };
-  
-  // Try exact match
-  if (State.masterIndex.has(gtin)) {
-    return {
-      name: State.masterIndex.get(gtin),
-      rms: State.masterRMS.get(gtin) || ''
-    };
-  }
-  
-  // Try GTIN-13
-  const gtin13 = gtin.startsWith('0') ? gtin.slice(1) : gtin;
-  if (State.masterIndex.has(gtin13)) {
-    return {
-      name: State.masterIndex.get(gtin13),
-      rms: State.masterRMS.get(gtin13) || ''
-    };
-  }
-  
-  // Try last 8 digits
-  const last8 = gtin.slice(-8);
-  if (State.masterIndex.has(last8)) {
-    return {
-      name: State.masterIndex.get(last8),
-      rms: State.masterRMS.get(last8) || ''
-    };
-  }
-  
-  return { name: '', rms: '' };
-}
+    // GTIN-13
+    const gtin13 = gtin.startsWith('0') ? gtin.slice(1) : gtin;
+    if (App.masterIndex.has(gtin13)) {
+      return {
+        name: App.masterIndex.get(gtin13),
+        rms: App.masterRMS.get(gtin13) || '',
+        matchType: 'GTIN13'
+      };
+    }
 
-// ========================================
-// PROCESS BARCODE
-// ========================================
-async function processBarcode(code) {
-  if (!code || !code.trim()) return;
-  
+    // Last 8 digits
+    const last8 = gtin.slice(-8);
+    if (App.masterIndex.has(last8)) {
+      return {
+        name: App.masterIndex.get(last8),
+        rms: App.masterRMS.get(last8) || '',
+        matchType: 'LAST8'
+      };
+    }
+
+    return { name: '', rms: '', matchType: 'NONE' };
+  }
+};
+
+// ============================================
+// EXTERNAL API LOOKUPS
+// ============================================
+const API = {
+  async lookup(gtin) {
+    if (!App.settings.apiEnabled || !navigator.onLine) return null;
+
+    const cleanGtin = gtin.replace(/\D/g, '').padStart(14, '0');
+
+    // Try Brocade (best for medicines)
+    let result = await this.brocade(cleanGtin);
+    if (result) return result;
+
+    // Try OpenFoodFacts
+    result = await this.openFoodFacts(cleanGtin);
+    if (result) return result;
+
+    // Try UPCitemdb
+    result = await this.upcItemDb(cleanGtin);
+    if (result) return result;
+
+    return null;
+  },
+
+  async brocade(gtin) {
+    try {
+      const res = await fetch(`https://www.brocade.io/api/items/${gtin}`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.name) {
+        return { name: data.name, source: 'Brocade' };
+      }
+    } catch (e) {
+      console.log('Brocade API:', e.message);
+    }
+    return null;
+  },
+
+  async openFoodFacts(gtin) {
+    try {
+      const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${gtin}.json`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      const data = await res.json();
+      if (data.status === 1 && data.product?.product_name) {
+        return { name: data.product.product_name, source: 'OpenFoodFacts' };
+      }
+    } catch (e) {
+      console.log('OpenFoodFacts API:', e.message);
+    }
+    return null;
+  },
+
+  async upcItemDb(gtin) {
+    try {
+      const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${gtin}`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      const data = await res.json();
+      if (data.code === 'OK' && data.items?.[0]?.title) {
+        return { name: data.items[0].title, source: 'UPCitemdb' };
+      }
+    } catch (e) {
+      console.log('UPCitemdb API:', e.message);
+    }
+    return null;
+  }
+};
+
+// ============================================
+// BARCODE PROCESSING
+// ============================================
+async function processBarcode(code, options = {}) {
+  const { silent = false, skipRefresh = false } = options;
+
+  if (!code || typeof code !== 'string') return null;
   code = code.trim();
-  console.log('Processing:', code);
-  
-  const parsed = parseGS1(code);
-  
+  if (!code) return null;
+
+  // Parse GS1
+  const parsed = GS1.parse(code);
+
+  // If no GTIN found, try to use raw as barcode
   if (!parsed.gtin) {
-    // Try to use raw as barcode
     const digits = code.replace(/\D/g, '');
-    if (digits.length >= 5) {
+    if (digits.length >= 8) {
       parsed.gtin = digits.padStart(14, '0');
     } else {
-      showToast('Invalid barcode', 'error');
-      return;
+      if (!silent) toast('Invalid barcode format', 'warning');
+      return null;
     }
   }
-  
-  // Match product
-  const match = matchProduct(parsed.gtin);
-  
-  // Create entry
+
+  // Find product in master
+  let match = Matcher.findProduct(parsed.gtin);
+
+  // Try API if not found
+  if (!match.name && App.settings.apiEnabled && navigator.onLine) {
+    const apiResult = await API.lookup(parsed.gtin);
+    if (apiResult) {
+      match.name = apiResult.name;
+      match.matchType = 'API';
+
+      // Auto-save to master
+      await DB.addMaster({
+        barcode: parsed.gtin,
+        name: apiResult.name,
+        rms: ''
+      });
+    }
+  }
+
+  // Create history entry
   const entry = {
     raw: parsed.raw,
     gtin: parsed.gtin,
     name: match.name || 'Unknown Product',
     rms: match.rms || '',
+    matchType: match.matchType,
     expiry: parsed.expiry,
     expiryISO: parsed.expiryISO,
     expiryDisplay: parsed.expiryDisplay,
@@ -371,133 +463,234 @@ async function processBarcode(code) {
     returnable: '',
     timestamp: Date.now()
   };
-  
-  // Save immediately
+
+  // Save to history
   const id = await DB.addHistory(entry);
-  console.log('Saved entry ID:', id);
-  
-  showToast(`Added: ${entry.name}`, 'success');
-  haptic('success');
-  
-  // Refresh UI
-  await refreshAll();
-  
-  // Clear input
-  const input = document.getElementById('barcodeInput');
-  if (input) input.value = '';
+  entry.id = id;
+
+  if (!silent) {
+    if (match.matchType === 'API') {
+      toast(`Found via API: ${entry.name}`, 'success');
+    } else if (match.name) {
+      toast(`Added: ${entry.name}`, 'success');
+    } else {
+      toast('Added: Unknown Product', 'info');
+    }
+    vibrate('success');
+  }
+
+  if (!skipRefresh) {
+    await refreshUI();
+  }
+
+  return entry;
 }
 
-// ========================================
-// SCANNER
-// ========================================
-async function initScanner() {
-  try {
-    State.cameras = await Html5Qrcode.getCameras();
-    if (State.cameras.length === 0) {
-      showToast('No camera found', 'error');
+// ============================================
+// BULK PROCESSING
+// ============================================
+async function processBulk() {
+  const textarea = document.getElementById('inputBulk');
+  const text = textarea.value.trim();
+
+  if (!text) {
+    toast('No barcodes to process', 'warning');
+    return;
+  }
+
+  const lines = text.split(/[\r\n]+/).map(l => l.trim()).filter(l => l.length > 0);
+
+  if (lines.length === 0) {
+    toast('No valid lines found', 'warning');
+    return;
+  }
+
+  // Show progress
+  const progressBar = document.getElementById('bulkProgress');
+  const progressFill = document.getElementById('bulkProgressFill');
+  const progressText = document.getElementById('bulkProgressText');
+  const btn = document.getElementById('btnProcessBulk');
+
+  progressBar.classList.add('active');
+  progressText.classList.add('active');
+  btn.disabled = true;
+
+  let success = 0;
+  let failed = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    try {
+      const result = await processBarcode(lines[i], { silent: true, skipRefresh: true });
+      if (result) success++;
+      else failed++;
+    } catch (e) {
+      failed++;
+    }
+
+    // Update progress
+    const percent = Math.round(((i + 1) / lines.length) * 100);
+    progressFill.style.width = percent + '%';
+    progressText.textContent = `Processing ${i + 1} of ${lines.length}...`;
+
+    // Yield to UI
+    if (i % 20 === 0) await sleep(10);
+  }
+
+  // Done
+  progressText.textContent = `Done! ${success} added, ${failed} failed`;
+  btn.disabled = false;
+
+  // Refresh UI
+  await refreshUI();
+
+  // Clear input
+  textarea.value = '';
+  updateBulkCount();
+
+  toast(`Processed ${success} barcodes`, 'success');
+  vibrate('success');
+
+  // Hide progress after delay
+  setTimeout(() => {
+    progressBar.classList.remove('active');
+    progressText.classList.remove('active');
+  }, 3000);
+}
+
+function updateBulkCount() {
+  const textarea = document.getElementById('inputBulk');
+  const countEl = document.getElementById('bulkCount');
+  if (!textarea || !countEl) return;
+
+  const lines = textarea.value.trim().split(/[\r\n]+/).filter(l => l.trim()).length;
+  countEl.textContent = lines > 0 ? `${lines} line${lines !== 1 ? 's' : ''}` : '0 lines';
+}
+
+function toggleBulk() {
+  const area = document.getElementById('bulkArea');
+  const toggle = document.getElementById('bulkToggle');
+
+  if (area.classList.contains('hidden')) {
+    area.classList.remove('hidden');
+    toggle.classList.remove('collapsed');
+  } else {
+    area.classList.add('hidden');
+    toggle.classList.add('collapsed');
+  }
+}
+
+// ============================================
+// CAMERA SCANNER
+// ============================================
+const Scanner = {
+  async init() {
+    try {
+      App.scanner.cameras = await Html5Qrcode.getCameras();
+      if (App.scanner.cameras.length === 0) {
+        toast('No camera found', 'error');
+        return false;
+      }
+
+      // Prefer back camera
+      const backIdx = App.scanner.cameras.findIndex(c =>
+        c.label.toLowerCase().includes('back') ||
+        c.label.toLowerCase().includes('rear') ||
+        c.label.toLowerCase().includes('environment')
+      );
+      App.scanner.currentCamera = backIdx >= 0 ? backIdx : 0;
+
+      return true;
+    } catch (e) {
+      toast('Camera access denied', 'error');
       return false;
     }
-    
-    // Prefer back camera
-    const backIdx = State.cameras.findIndex(c => 
-      c.label.toLowerCase().includes('back') || 
-      c.label.toLowerCase().includes('rear')
-    );
-    State.currentCamera = backIdx >= 0 ? backIdx : 0;
-    
-    return true;
-  } catch (err) {
-    console.error('Camera init error:', err);
-    showToast('Camera access denied', 'error');
-    return false;
-  }
-}
+  },
 
-async function toggleScanner() {
-  if (State.scannerActive) {
-    await stopScanner();
-  } else {
-    await startScanner();
-  }
-}
+  async toggle() {
+    if (App.scanner.active) {
+      await this.stop();
+    } else {
+      await this.start();
+    }
+  },
 
-async function startScanner() {
-  if (State.cameras.length === 0) {
-    const init = await initScanner();
-    if (!init) return;
-  }
-  
-  try {
-    State.html5QrCode = new Html5Qrcode('reader');
-    
-    const config = {
-      fps: 10,
-      qrbox: { width: 250, height: 250 },
-      formatsToSupport: [
-        Html5QrcodeSupportedFormats.QR_CODE,
-        Html5QrcodeSupportedFormats.DATA_MATRIX,
-        Html5QrcodeSupportedFormats.CODE_128,
-        Html5QrcodeSupportedFormats.CODE_39,
-        Html5QrcodeSupportedFormats.EAN_13,
-        Html5QrcodeSupportedFormats.EAN_8,
-        Html5QrcodeSupportedFormats.UPC_A,
-        Html5QrcodeSupportedFormats.ITF
-      ]
-    };
-    
-    await State.html5QrCode.start(
-      State.cameras[State.currentCamera].id,
-      config,
-      onScanSuccess,
-      () => {}
-    );
-    
-    State.scannerActive = true;
-    document.getElementById('scannerContainer').classList.add('show');
-    document.getElementById('btnScanner').classList.add('active');
-    document.getElementById('btnScanner').innerHTML = '<span>⏹️</span> Stop Scanner';
-    
-    haptic('medium');
-  } catch (err) {
-    console.error('Scanner error:', err);
-    showToast('Scanner error: ' + err.message, 'error');
-  }
-}
+  async start() {
+    if (App.scanner.cameras.length === 0) {
+      const ok = await this.init();
+      if (!ok) return;
+    }
 
-async function stopScanner() {
-  if (!State.html5QrCode) return;
-  
-  try {
-    await State.html5QrCode.stop();
-    State.html5QrCode.clear();
-  } catch (err) {
-    console.error('Stop scanner error:', err);
+    try {
+      App.scanner.instance = new Html5Qrcode('reader');
+
+      const config = {
+        fps: 10,
+        qrbox: { width: 250, height: 250 },
+        formatsToSupport: [
+          Html5QrcodeSupportedFormats.QR_CODE,
+          Html5QrcodeSupportedFormats.DATA_MATRIX,
+          Html5QrcodeSupportedFormats.CODE_128,
+          Html5QrcodeSupportedFormats.CODE_39,
+          Html5QrcodeSupportedFormats.EAN_13,
+          Html5QrcodeSupportedFormats.EAN_8,
+          Html5QrcodeSupportedFormats.UPC_A,
+          Html5QrcodeSupportedFormats.ITF
+        ]
+      };
+
+      await App.scanner.instance.start(
+        App.scanner.cameras[App.scanner.currentCamera].id,
+        config,
+        this.onScan.bind(this),
+        () => { }
+      );
+
+      App.scanner.active = true;
+      document.getElementById('scannerBox').classList.add('active');
+      document.getElementById('btnScanner').innerHTML = '<span>⏹️</span> Stop Scanner';
+      document.getElementById('btnScanner').classList.add('active');
+
+      vibrate('medium');
+    } catch (e) {
+      console.error('Scanner error:', e);
+      toast('Scanner error', 'error');
+    }
+  },
+
+  async stop() {
+    if (!App.scanner.instance) return;
+
+    try {
+      await App.scanner.instance.stop();
+      App.scanner.instance.clear();
+    } catch (e) { }
+
+    App.scanner.active = false;
+    App.scanner.instance = null;
+
+    document.getElementById('scannerBox').classList.remove('active');
+    document.getElementById('btnScanner').innerHTML = '<span>📷</span> Open Camera';
+    document.getElementById('btnScanner').classList.remove('active');
+  },
+
+  async onScan(decodedText) {
+    console.log('📷 Scanned:', decodedText);
+
+    // Stop scanner
+    await this.stop();
+
+    // Put in input
+    document.getElementById('inputBarcode').value = decodedText;
+
+    // Process
+    await processBarcode(decodedText);
   }
-  
-  State.scannerActive = false;
-  State.html5QrCode = null;
-  document.getElementById('scannerContainer').classList.remove('show');
-  document.getElementById('btnScanner').classList.remove('active');
-  document.getElementById('btnScanner').innerHTML = '<span>📷</span> Open Camera Scanner';
-}
+};
 
-async function onScanSuccess(decodedText) {
-  console.log('Scanned:', decodedText);
-  
-  // Stop scanner
-  await stopScanner();
-  
-  // Put in input field
-  document.getElementById('barcodeInput').value = decodedText;
-  
-  // Process immediately
-  await processBarcode(decodedText);
-}
-
-// ========================================
+// ============================================
 // UI REFRESH
-// ========================================
-async function refreshAll() {
+// ============================================
+async function refreshUI() {
   await Promise.all([
     refreshStats(),
     refreshRecent(),
@@ -508,16 +701,16 @@ async function refreshAll() {
 
 async function refreshStats() {
   const history = await DB.getAllHistory();
-  
+
   let expired = 0, expiring = 0, ok = 0;
-  
+
   for (const item of history) {
-    const status = getExpiryStatus(item.expiryISO);
+    const status = GS1.getExpiryStatus(item.expiryISO);
     if (status === 'expired') expired++;
     else if (status === 'expiring') expiring++;
     else if (status === 'ok') ok++;
   }
-  
+
   document.getElementById('statExpired').textContent = expired;
   document.getElementById('statExpiring').textContent = expiring;
   document.getElementById('statOk').textContent = ok;
@@ -526,10 +719,10 @@ async function refreshStats() {
 async function refreshRecent() {
   const history = await DB.getAllHistory();
   history.sort((a, b) => b.timestamp - a.timestamp);
-  
+
   const recent = history.slice(0, 10);
-  const container = document.getElementById('recentItems');
-  
+  const container = document.getElementById('recentList');
+
   if (recent.length === 0) {
     container.innerHTML = `
       <div class="empty-state">
@@ -540,33 +733,34 @@ async function refreshRecent() {
     `;
     return;
   }
-  
+
   container.innerHTML = recent.map(item => renderItemCard(item)).join('');
 }
 
 async function refreshHistory() {
   const history = await DB.getAllHistory();
   history.sort((a, b) => b.timestamp - a.timestamp);
-  
+
   let filtered = history;
-  
+
   // Apply filter
-  if (State.currentFilter !== 'all') {
-    filtered = history.filter(h => getExpiryStatus(h.expiryISO) === State.currentFilter);
+  if (App.filter !== 'all') {
+    filtered = history.filter(h => GS1.getExpiryStatus(h.expiryISO) === App.filter);
   }
-  
+
   // Apply search
-  if (State.searchQuery) {
-    const q = State.searchQuery.toLowerCase();
-    filtered = filtered.filter(h => 
+  if (App.search) {
+    const q = App.search.toLowerCase();
+    filtered = filtered.filter(h =>
       (h.name && h.name.toLowerCase().includes(q)) ||
       (h.gtin && h.gtin.includes(q)) ||
-      (h.batch && h.batch.toLowerCase().includes(q))
+      (h.batch && h.batch.toLowerCase().includes(q)) ||
+      (h.rms && h.rms.includes(q))
     );
   }
-  
+
   const container = document.getElementById('historyList');
-  
+
   if (filtered.length === 0) {
     container.innerHTML = `
       <div class="empty-state">
@@ -577,18 +771,19 @@ async function refreshHistory() {
     `;
     return;
   }
-  
+
   container.innerHTML = filtered.map(item => renderItemCard(item, true)).join('');
 }
 
 function renderItemCard(item, showActions = true) {
-  const status = getExpiryStatus(item.expiryISO);
-  
+  const status = GS1.getExpiryStatus(item.expiryISO);
+  const cardClass = item.matchType === 'API' ? 'api' : status;
+
   return `
-    <div class="item-card ${status}" data-id="${item.id}">
+    <div class="item-card ${cardClass}" data-id="${item.id}">
       <div class="item-header">
-        <div class="item-name">${escapeHtml(item.name || 'Unknown')}</div>
-        <div class="item-expiry-badge">${item.expiryDisplay || 'No expiry'}</div>
+        <span class="item-name">${escapeHtml(item.name || 'Unknown')}</span>
+        <span class="item-badge">${item.expiryDisplay || 'No expiry'}</span>
       </div>
       <div class="item-details">
         <div class="item-detail">
@@ -610,12 +805,8 @@ function renderItemCard(item, showActions = true) {
       </div>
       ${showActions ? `
         <div class="item-actions">
-          <button class="item-action-btn edit" onclick="editItem(${item.id})">
-            ✏️ Edit
-          </button>
-          <button class="item-action-btn delete" onclick="deleteItem(${item.id})">
-            🗑️ Delete
-          </button>
+          <button class="item-btn edit" onclick="editItem(${item.id})">✏️ Edit</button>
+          <button class="item-btn delete" onclick="deleteItem(${item.id})">🗑️ Delete</button>
         </div>
       ` : ''}
     </div>
@@ -625,172 +816,180 @@ function renderItemCard(item, showActions = true) {
 async function refreshMasterCount() {
   const master = await DB.getAllMaster();
   document.getElementById('masterCount').textContent = master.length;
-  buildMasterIndex(master);
+  Matcher.buildIndex(master);
 }
 
-// ========================================
-// EDIT/DELETE
-// ========================================
+// ============================================
+// EDIT & DELETE
+// ============================================
 async function editItem(id) {
   const item = await DB.getHistory(id);
   if (!item) {
-    showToast('Item not found', 'error');
+    toast('Item not found', 'error');
     return;
   }
-  
+
   document.getElementById('editId').value = id;
   document.getElementById('editName').value = item.name || '';
+  document.getElementById('editGtin').value = item.gtin || '';
   document.getElementById('editExpiry').value = item.expiryISO || '';
   document.getElementById('editBatch').value = item.batch || '';
   document.getElementById('editQty').value = item.qty || 1;
   document.getElementById('editRms').value = item.rms || '';
   document.getElementById('editSupplier').value = item.supplier || '';
   document.getElementById('editReturnable').value = item.returnable || '';
-  
-  document.getElementById('editModal').classList.add('show');
+
+  document.getElementById('editModal').classList.add('active');
 }
 
 async function saveEdit() {
   const id = parseInt(document.getElementById('editId').value);
   const item = await DB.getHistory(id);
-  
+
   if (!item) {
-    showToast('Item not found', 'error');
+    toast('Item not found', 'error');
     return;
   }
-  
+
   const expiryISO = document.getElementById('editExpiry').value;
   let expiryDisplay = '';
-  
+
   if (expiryISO) {
     const d = new Date(expiryISO);
     expiryDisplay = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
   }
-  
-  item.name = document.getElementById('editName').value;
+
+  item.name = document.getElementById('editName').value.trim();
   item.expiryISO = expiryISO;
   item.expiryDisplay = expiryDisplay;
-  item.batch = document.getElementById('editBatch').value;
+  item.batch = document.getElementById('editBatch').value.trim();
   item.qty = parseInt(document.getElementById('editQty').value) || 1;
-  item.rms = document.getElementById('editRms').value;
-  item.supplier = document.getElementById('editSupplier').value;
+  item.rms = document.getElementById('editRms').value.trim();
+  item.supplier = document.getElementById('editSupplier').value.trim();
   item.returnable = document.getElementById('editReturnable').value;
-  
+
   await DB.updateHistory(item);
-  
-  // Update master if name changed
+
+  // Update master if name provided
   if (item.name && item.gtin) {
-    await DB.addMaster({ barcode: item.gtin, name: item.name, rms: item.rms });
+    await DB.addMaster({
+      barcode: item.gtin,
+      name: item.name,
+      rms: item.rms
+    });
     await refreshMasterCount();
   }
-  
-  closeEditModal();
-  await refreshAll();
-  
-  showToast('Item updated', 'success');
+
+  closeModal();
+  await refreshUI();
+  toast('Item updated', 'success');
 }
 
-function closeEditModal() {
-  document.getElementById('editModal').classList.remove('show');
+function closeModal() {
+  document.getElementById('editModal').classList.remove('active');
 }
 
 async function deleteItem(id) {
   if (!confirm('Delete this item?')) return;
-  
+
   await DB.deleteHistory(id);
-  await refreshAll();
-  
-  showToast('Item deleted', 'success');
+  await refreshUI();
+  toast('Item deleted', 'success');
 }
 
-// ========================================
-// MASTER DATA
-// ========================================
+// ============================================
+// MASTER DATA MANAGEMENT
+// ============================================
 async function uploadMaster(file, append = false) {
-  showLoading(true);
-  
+  showLoading('Uploading...');
+
   try {
     const text = await file.text();
     const lines = text.trim().split(/[\r\n]+/);
-    
+
     if (lines.length < 2) {
-      showToast('Invalid file', 'error');
-      showLoading(false);
+      toast('Invalid file format', 'error');
+      hideLoading();
       return;
     }
-    
+
     // Parse header
     const header = lines[0].toLowerCase();
     const delim = header.includes('\t') ? '\t' : ',';
-    const headers = header.split(delim).map(h => h.trim().replace(/['"]/g, ''));
-    
-    const barcodeIdx = headers.findIndex(h => 
-      ['barcode', 'gtin', 'ean', 'code'].includes(h)
-    );
-    const nameIdx = headers.findIndex(h => 
-      ['name', 'description', 'product'].includes(h)
-    );
-    const rmsIdx = headers.findIndex(h => 
-      ['rms', 'rms code', 'rmscode'].includes(h)
-    );
-    
+    const cols = header.split(delim).map(c => c.trim().replace(/['"]/g, ''));
+
+    // Find columns
+    const barcodeIdx = cols.findIndex(c => ['barcode', 'gtin', 'ean', 'upc', 'code'].includes(c));
+    const nameIdx = cols.findIndex(c => ['name', 'description', 'product', 'productname'].includes(c));
+    const rmsIdx = cols.findIndex(c => ['rms', 'rmscode', 'rms code', 'rms_code'].includes(c));
+
     if (barcodeIdx === -1) {
-      showToast('No barcode column found', 'error');
-      showLoading(false);
+      toast('No barcode column found (need: barcode, gtin, ean, or code)', 'error');
+      hideLoading();
       return;
     }
-    
+
     if (!append) {
       await DB.clearMaster();
     }
-    
+
+    // Parse rows
     const items = [];
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(delim).map(c => c.trim().replace(/['"]/g, ''));
-      const barcode = cols[barcodeIdx];
-      const name = nameIdx >= 0 ? cols[nameIdx] : '';
-      const rms = rmsIdx >= 0 ? cols[rmsIdx] : '';
-      
-      if (barcode) {
+      const row = lines[i].split(delim).map(c => c.trim().replace(/['"]/g, ''));
+      const barcode = row[barcodeIdx];
+      const name = nameIdx >= 0 ? row[nameIdx] : '';
+      const rms = rmsIdx >= 0 ? row[rmsIdx] : '';
+
+      if (barcode && barcode.length >= 8) {
         items.push({ barcode, name, rms });
       }
     }
-    
+
     const count = await DB.bulkAddMaster(items);
     await refreshMasterCount();
-    
-    showToast(`${append ? 'Appended' : 'Uploaded'} ${count} products`, 'success');
-  } catch (err) {
-    console.error('Upload error:', err);
-    showToast('Upload failed: ' + err.message, 'error');
+
+    toast(`${append ? 'Appended' : 'Uploaded'} ${count} products`, 'success');
+  } catch (e) {
+    console.error('Upload error:', e);
+    toast('Upload failed: ' + e.message, 'error');
   }
-  
-  showLoading(false);
+
+  hideLoading();
 }
 
 async function resetMaster() {
-  if (!confirm('Reset all product data?')) return;
-  
+  if (!confirm('Reset all product data? This cannot be undone.')) return;
+
   await DB.clearMaster();
   await refreshMasterCount();
-  
-  showToast('Master data reset', 'success');
+  toast('Master data cleared', 'success');
 }
 
-// ========================================
-// EXPORT
-// ========================================
-async function exportData() {
+function downloadTemplate() {
+  const template = `barcode,name,rms
+06291107439358,Zyrtec 75ml Bottle,220155756
+00840149658430,VIAGRA 100MG 4S,220153086
+06285074002448,Yasmin 21s Blister,220164755
+06291109120469,Panadol Advance 24s,220236078`;
+
+  downloadFile(template, 'master-template.csv', 'text/csv');
+  toast('Template downloaded', 'success');
+}
+
+// ============================================
+// EXPORT & BACKUP
+// ============================================
+async function exportCSV() {
   const history = await DB.getAllHistory();
-  
+
   if (history.length === 0) {
-    showToast('No data to export', 'warning');
+    toast('No data to export', 'warning');
     return;
   }
-  
-  // Headers: RMS | BARCODE | DESCRIPTION | EXPIRY | BATCH | QTY | RETURNABLE | SUPPLIER
+
   const headers = ['RMS', 'BARCODE', 'DESCRIPTION', 'EXPIRY', 'BATCH', 'QTY', 'RETURNABLE', 'SUPPLIER'];
-  
+
   const rows = history.map(h => [
     h.rms || '',
     h.gtin || '',
@@ -801,147 +1000,173 @@ async function exportData() {
     h.returnable || '',
     h.supplier || ''
   ]);
-  
+
   let csv = headers.join(',') + '\n';
   for (const row of rows) {
     csv += row.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',') + '\n';
   }
-  
+
   downloadFile(csv, `expiry-export-${formatDate(new Date())}.csv`, 'text/csv');
-  showToast('Export downloaded', 'success');
+  toast('Export downloaded', 'success');
 }
 
-// ========================================
-// BACKUP/RESTORE
-// ========================================
 async function downloadBackup() {
   const history = await DB.getAllHistory();
   const master = await DB.getAllMaster();
-  
+
   const backup = {
-    version: '5.0.0',
+    version: CONFIG.VERSION,
     timestamp: Date.now(),
+    date: new Date().toISOString(),
     history,
     master
   };
-  
+
   downloadFile(JSON.stringify(backup, null, 2), `backup-${formatDate(new Date())}.json`, 'application/json');
-  showToast('Backup downloaded', 'success');
+  toast('Backup downloaded', 'success');
 }
 
 async function restoreBackup(file) {
-  showLoading(true);
-  
+  showLoading('Restoring...');
+
   try {
     const text = await file.text();
     const backup = JSON.parse(text);
-    
-    if (backup.history) {
+
+    if (!backup.history && !backup.master) {
+      toast('Invalid backup file', 'error');
+      hideLoading();
+      return;
+    }
+
+    if (backup.history && backup.history.length > 0) {
       await DB.clearHistory();
       for (const item of backup.history) {
         delete item.id;
         await DB.addHistory(item);
       }
     }
-    
-    if (backup.master) {
+
+    if (backup.master && backup.master.length > 0) {
       await DB.clearMaster();
       await DB.bulkAddMaster(backup.master);
     }
-    
-    await refreshAll();
-    showToast('Backup restored', 'success');
-  } catch (err) {
-    console.error('Restore error:', err);
-    showToast('Restore failed', 'error');
+
+    await refreshUI();
+    await refreshMasterCount();
+
+    toast(`Restored ${backup.history?.length || 0} items, ${backup.master?.length || 0} products`, 'success');
+  } catch (e) {
+    console.error('Restore error:', e);
+    toast('Restore failed', 'error');
   }
-  
-  showLoading(false);
+
+  hideLoading();
 }
 
 async function clearHistory() {
-  if (!confirm('Clear all history? This cannot be undone.')) return;
-  
+  if (!confirm('Clear all scanned items? This cannot be undone.')) return;
+
   await DB.clearHistory();
-  await refreshAll();
-  
-  showToast('History cleared', 'success');
+  await refreshUI();
+  toast('History cleared', 'success');
 }
 
-// ========================================
+// ============================================
 // NAVIGATION
-// ========================================
+// ============================================
 function showPage(pageId) {
+  // Hide all pages
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.getElementById(`page-${pageId}`).classList.add('active');
-  
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  document.querySelector(`.nav-item[data-page="${pageId}"]`).classList.add('active');
-  
-  if (pageId !== 'home' && State.scannerActive) {
-    stopScanner();
+
+  // Show target
+  const page = document.getElementById(`page-${pageId}`);
+  if (page) page.classList.add('active');
+
+  // Update nav
+  document.querySelectorAll('.nav-btn').forEach(n => n.classList.remove('active'));
+  document.querySelector(`.nav-btn[data-page="${pageId}"]`)?.classList.add('active');
+
+  // Stop scanner if leaving home
+  if (pageId !== 'home' && App.scanner.active) {
+    Scanner.stop();
   }
-  
+
   closeMenu();
-  haptic('light');
+  vibrate('light');
 }
 
 function openMenu() {
-  document.getElementById('menuOverlay').classList.add('show');
-  document.getElementById('sideMenu').classList.add('show');
+  document.getElementById('menuOverlay').classList.add('active');
+  document.getElementById('sideMenu').classList.add('active');
 }
 
 function closeMenu() {
-  document.getElementById('menuOverlay').classList.remove('show');
-  document.getElementById('sideMenu').classList.remove('show');
+  document.getElementById('menuOverlay').classList.remove('active');
+  document.getElementById('sideMenu').classList.remove('active');
 }
 
-function filterItems(filter) {
-  State.currentFilter = filter;
-  
-  document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
-  document.querySelector(`.filter-tab[data-filter="${filter}"]`)?.classList.add('active');
-  
+function filterBy(status) {
+  App.filter = status;
+
+  // Update tabs
+  document.querySelectorAll('.filter-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.filter === status);
+  });
+
   refreshHistory();
   showPage('history');
 }
 
-// ========================================
+// ============================================
 // UTILITIES
-// ========================================
-function showToast(message, type = 'info') {
-  const container = document.getElementById('toastContainer');
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  toast.textContent = message;
-  container.appendChild(toast);
-  
+// ============================================
+function toast(message, type = 'info') {
+  const container = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = message;
+  container.appendChild(el);
+
   setTimeout(() => {
-    toast.style.opacity = '0';
-    setTimeout(() => toast.remove(), 300);
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 300);
   }, 3000);
 }
 
-function showLoading(show) {
-  document.getElementById('loadingOverlay').classList.toggle('show', show);
+function showLoading(text = 'Loading...') {
+  document.getElementById('loadingText').textContent = text;
+  document.getElementById('loading').classList.add('active');
 }
 
-function haptic(type = 'light') {
+function hideLoading() {
+  document.getElementById('loading').classList.remove('active');
+}
+
+function vibrate(type = 'light') {
   if (!navigator.vibrate) return;
   switch (type) {
     case 'light': navigator.vibrate(10); break;
     case 'medium': navigator.vibrate(30); break;
     case 'success': navigator.vibrate([30, 50, 30]); break;
+    case 'error': navigator.vibrate([100, 50, 100]); break;
   }
 }
 
 function escapeHtml(str) {
   if (!str) return '';
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 function formatDate(date) {
-  return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}${m}${d}`;
 }
 
 function downloadFile(content, filename, mimeType) {
@@ -956,413 +1181,64 @@ function downloadFile(content, filename, mimeType) {
   URL.revokeObjectURL(url);
 }
 
-// ========================================
-// EVENT LISTENERS
-// ========================================
-function setupEventListeners() {
-  // Barcode input
-  const barcodeInput = document.getElementById('barcodeInput');
-  barcodeInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      processBarcode(barcodeInput.value);
-    }
-  });
-  
-  // Auto-process on paste
-  barcodeInput.addEventListener('paste', (e) => {
-    setTimeout(() => {
-      processBarcode(barcodeInput.value);
-    }, 100);
-  });
-  
-  // Scanner button
-  document.getElementById('btnScanner').addEventListener('click', toggleScanner);
-  
-  // Navigation
-  document.querySelectorAll('.nav-item').forEach(nav => {
-    nav.addEventListener('click', () => showPage(nav.dataset.page));
-  });
-  
-  // Menu
-  document.getElementById('btnMenu').addEventListener('click', openMenu);
-  document.getElementById('menuOverlay').addEventListener('click', closeMenu);
-  
-  // Search
-  document.getElementById('searchInput').addEventListener('input', (e) => {
-    State.searchQuery = e.target.value;
-    refreshHistory();
-  });
-  
-  // Filter tabs
-  document.querySelectorAll('.filter-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      State.currentFilter = tab.dataset.filter;
-      document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      refreshHistory();
-    });
-  });
-  
-  // File inputs
-  document.getElementById('fileMaster').addEventListener('change', (e) => {
-    if (e.target.files[0]) {
-      uploadMaster(e.target.files[0], false);
-      e.target.value = '';
-    }
-  });
-  
-  document.getElementById('fileAppend').addEventListener('change', (e) => {
-    if (e.target.files[0]) {
-      uploadMaster(e.target.files[0], true);
-      e.target.value = '';
-    }
-  });
-  
-  document.getElementById('fileRestore').addEventListener('change', (e) => {
-    if (e.target.files[0]) {
-      restoreBackup(e.target.files[0]);
-      e.target.value = '';
-    }
-  });
-  
-  // Edit modal
-  document.getElementById('editModal').addEventListener('click', (e) => {
-    if (e.target.id === 'editModal') closeEditModal();
-  });
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
-// ========================================
-// INITIALIZE
-// ========================================
-async function init() {
-  console.log('Expiry Tracker v5.0.0 initializing...');
-  
-  try {
-    await DB.init();
-    console.log('Database ready');
-    
-    await refreshMasterCount();
-    await refreshAll();
-    
-    setupEventListeners();
-    
-    // Focus barcode input
-    setTimeout(() => {
-      document.getElementById('barcodeInput').focus();
-    }, 100);
-    
-    // Hide splash after animation
-    setTimeout(() => {
-      document.getElementById('splashScreen').classList.add('hide');
-      document.getElementById('app').classList.add('show');
-    }, 2500);
-    
-    // Register service worker
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').catch(() => {});
-    }
-    
-    console.log('App ready!');
-  } catch (err) {
-    console.error('Init error:', err);
-    showToast('Failed to initialize', 'error');
-  }
-}
-
-// Start
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
-} else {
-  init();
-}
-
-// ========================================
-// EXTERNAL API LOOKUPS
-// ========================================
-
-/**
- * Look up product from external APIs when not found in master
- * Tries: Brocade → Open Food Facts → UPCitemdb
- */
-async function lookupExternalAPIs(gtin) {
-  const cleanGtin = gtin.replace(/\D/g, '');
-  
-  // Try Brocade first (best for medicines)
-  let result = await lookupBrocade(cleanGtin);
-  if (result && result.name) return result;
-  
-  // Try Open Food Facts
-  result = await lookupOpenFoodFacts(cleanGtin);
-  if (result && result.name) return result;
-  
-  // Try UPCitemdb
-  result = await lookupUPCItemDB(cleanGtin);
-  if (result && result.name) return result;
-  
-  return null;
-}
-
-async function lookupBrocade(gtin) {
-  try {
-    const gtin14 = gtin.padStart(14, '0');
-    const response = await fetch(`https://www.brocade.io/api/items/${gtin14}`, {
-      method: 'GET',
-      headers: { 'Accept': 'application/json' }
-    });
-    
-    if (!response.ok) return null;
-    
-    const data = await response.json();
-    return {
-      gtin: data.gtin14 || gtin,
-      name: data.name || '',
-      brand: data.brand_name || '',
-      matchType: 'API'
-    };
-  } catch (e) {
-    console.log('Brocade lookup failed:', e.message);
-    return null;
-  }
-}
-
-async function lookupOpenFoodFacts(barcode) {
-  try {
-    const response = await fetch(
-      `https://world.openfoodfacts.org/api/v2/product/${barcode}.json`,
-      { headers: { 'Accept': 'application/json' } }
-    );
-    const data = await response.json();
-    
-    if (data.status !== 1 || !data.product) return null;
-    
-    return {
-      gtin: data.code || barcode,
-      name: data.product.product_name || '',
-      brand: data.product.brands || '',
-      matchType: 'API'
-    };
-  } catch (e) {
-    console.log('OpenFoodFacts lookup failed:', e.message);
-    return null;
-  }
-}
-
-async function lookupUPCItemDB(barcode) {
-  try {
-    const response = await fetch(
-      `https://api.upcitemdb.com/prod/trial/lookup?upc=${barcode}`,
-      { headers: { 'Accept': 'application/json' } }
-    );
-    const data = await response.json();
-    
-    if (data.code !== 'OK' || !data.items?.length) return null;
-    
-    return {
-      gtin: data.items[0].ean || barcode,
-      name: data.items[0].title || '',
-      brand: data.items[0].brand || '',
-      matchType: 'API'
-    };
-  } catch (e) {
-    console.log('UPCitemdb lookup failed:', e.message);
-    return null;
-  }
-}
-
-// Override the original matchProduct to include API lookup
-const originalMatchProduct = matchProduct;
-matchProduct = async function(gtin) {
-  // First try local master data
-  const localResult = originalMatchProduct(gtin);
-  
-  if (localResult.name) {
-    return localResult;
-  }
-  
-  // If not found locally and online, try APIs
-  if (navigator.onLine) {
-    console.log('Product not in master, trying APIs...');
-    const apiResult = await lookupExternalAPIs(gtin);
-    
-    if (apiResult && apiResult.name) {
-      console.log('Found via API:', apiResult.name);
-      
-      // Auto-save to master for future use
-      await DB.addMaster({
-        barcode: gtin,
-        name: apiResult.name,
-        rms: ''
-      });
-      
-      // Rebuild index
-      const master = await DB.getAllMaster();
-      buildMasterIndex(master);
-      
-      return {
-        name: apiResult.name,
-        rms: '',
-        matchType: 'API'
-      };
-    }
-  }
-  
-  return { name: '', rms: '', matchType: 'NONE' };
-};
-
-// Update processBarcode to handle async matchProduct
-const originalProcessBarcode = processBarcode;
-processBarcode = async function(code) {
-  if (!code || !code.trim()) return;
-  
-  code = code.trim();
-  console.log('Processing:', code);
-  
-  const parsed = parseGS1(code);
-  
-  if (!parsed.gtin) {
-    const digits = code.replace(/\D/g, '');
-    if (digits.length >= 5) {
-      parsed.gtin = digits.padStart(14, '0');
-    } else {
-      showToast('Invalid barcode', 'error');
-      return;
-    }
-  }
-  
-  // Show loading for API lookup
-  showLoading(true);
-  
-  // Match product (now async with API fallback)
-  const match = await matchProduct(parsed.gtin);
-  
-  showLoading(false);
-  
-  // Create entry
-  const entry = {
-    raw: parsed.raw,
-    gtin: parsed.gtin,
-    name: match.name || 'Unknown Product',
-    rms: match.rms || '',
-    matchType: match.matchType || 'NONE',
-    expiry: parsed.expiry,
-    expiryISO: parsed.expiryISO,
-    expiryDisplay: parsed.expiryDisplay,
-    batch: parsed.batch,
-    serial: parsed.serial,
-    qty: 1,
-    supplier: '',
-    returnable: '',
-    timestamp: Date.now()
-  };
-  
-  // Save immediately
-  const id = await DB.addHistory(entry);
-  console.log('Saved entry ID:', id);
-  
-  // Show appropriate toast
-  if (match.matchType === 'API') {
-    showToast(`Found via API: ${entry.name}`, 'success');
-  } else if (match.name) {
-    showToast(`Added: ${entry.name}`, 'success');
-  } else {
-    showToast('Added: Unknown Product (edit to add name)', 'warning');
-  }
-  
-  haptic('success');
-  
-  // Refresh UI
-  await refreshAll();
-  
-  // Clear input
-  const input = document.getElementById('barcodeInput');
-  if (input) input.value = '';
-};
-
-console.log('API integration loaded!');
- 'medium': navigator.vibrate(30); break;
-    case 'success': navigator.vibrate([30, 50, 30]); break;
-  }
-}
-
-function escapeHtml(str) {
-  if (!str) return '';
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function formatDate(date) {
-  return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
-}
-
-function downloadFile(content, filename, mimeType) {
-  const blob = new Blob([content], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-// ========================================
-// EVENT LISTENERS
-// ========================================
-function setupEventListeners() {
+// ============================================
+// EVENT SETUP
+// ============================================
+function setupEvents() {
   // Single barcode input
-  const barcodeInput = document.getElementById('barcodeInput');
-  barcodeInput.addEventListener('keydown', (e) => {
+  const inputBarcode = document.getElementById('inputBarcode');
+  inputBarcode.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      processBarcode(barcodeInput.value);
-      barcodeInput.value = '';
+      processBarcode(inputBarcode.value);
+      inputBarcode.value = '';
     }
   });
-  
-  barcodeInput.addEventListener('paste', (e) => {
+
+  inputBarcode.addEventListener('paste', () => {
     setTimeout(() => {
-      processBarcode(barcodeInput.value);
-      barcodeInput.value = '';
+      processBarcode(inputBarcode.value);
+      inputBarcode.value = '';
     }, 100);
   });
-  
+
   // Bulk input
-  const bulkInput = document.getElementById('bulkInput');
-  bulkInput.addEventListener('input', updateBulkLineCount);
-  bulkInput.addEventListener('paste', () => setTimeout(updateBulkLineCount, 100));
-  
-  // Bulk process button
-  document.getElementById('btnProcessBulk').addEventListener('click', processBulkBarcodes);
-  
+  document.getElementById('inputBulk').addEventListener('input', updateBulkCount);
+  document.getElementById('inputBulk').addEventListener('paste', () => setTimeout(updateBulkCount, 100));
+  document.getElementById('btnProcessBulk').addEventListener('click', processBulk);
+
   // Scanner
-  document.getElementById('btnScanner').addEventListener('click', toggleScanner);
-  
+  document.getElementById('btnScanner').addEventListener('click', () => Scanner.toggle());
+
   // Navigation
-  document.querySelectorAll('.nav-item').forEach(nav => {
-    nav.addEventListener('click', () => showPage(nav.dataset.page));
+  document.querySelectorAll('.nav-btn').forEach(btn => {
+    btn.addEventListener('click', () => showPage(btn.dataset.page));
   });
-  
+
   // Menu
   document.getElementById('btnMenu').addEventListener('click', openMenu);
   document.getElementById('menuOverlay').addEventListener('click', closeMenu);
-  
+
   // Search
-  document.getElementById('searchInput').addEventListener('input', (e) => {
-    State.searchQuery = e.target.value;
+  document.getElementById('inputSearch').addEventListener('input', (e) => {
+    App.search = e.target.value;
     refreshHistory();
   });
-  
+
   // Filter tabs
   document.querySelectorAll('.filter-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-      State.currentFilter = tab.dataset.filter;
+      App.filter = tab.dataset.filter;
       document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
       refreshHistory();
     });
   });
-  
+
   // File inputs
   document.getElementById('fileMaster').addEventListener('change', (e) => {
     if (e.target.files[0]) {
@@ -1370,66 +1246,107 @@ function setupEventListeners() {
       e.target.value = '';
     }
   });
-  
+
   document.getElementById('fileAppend').addEventListener('change', (e) => {
     if (e.target.files[0]) {
       uploadMaster(e.target.files[0], true);
       e.target.value = '';
     }
   });
-  
+
   document.getElementById('fileRestore').addEventListener('change', (e) => {
     if (e.target.files[0]) {
       restoreBackup(e.target.files[0]);
       e.target.value = '';
     }
   });
-  
-  // Edit modal
+
+  // API toggle
+  const apiToggle = document.getElementById('toggleAPI');
+  apiToggle.addEventListener('change', () => {
+    App.settings.apiEnabled = apiToggle.checked;
+    updateAPIIndicator();
+    DB.setSetting('apiEnabled', apiToggle.checked);
+  });
+
+  document.getElementById('btnToggleAPI').addEventListener('click', () => {
+    apiToggle.checked = !apiToggle.checked;
+    App.settings.apiEnabled = apiToggle.checked;
+    updateAPIIndicator();
+    DB.setSetting('apiEnabled', apiToggle.checked);
+  });
+
+  // Modal
   document.getElementById('editModal').addEventListener('click', (e) => {
-    if (e.target.id === 'editModal') closeEditModal();
+    if (e.target.id === 'editModal') closeModal();
   });
 }
 
-// ========================================
-// INITIALIZE
-// ========================================
-async function init() {
-  console.log('Expiry Tracker v5.1.0 initializing...');
-  
-  try {
-    await DB.init();
-    console.log('Database ready');
-    
-    await refreshMasterCount();
-    await refreshAll();
-    
-    setupEventListeners();
-    
-    // Focus single barcode input
-    setTimeout(() => {
-      document.getElementById('barcodeInput').focus();
-    }, 100);
-    
-    // Hide splash
-    setTimeout(() => {
-      document.getElementById('splashScreen').classList.add('hide');
-      document.getElementById('app').classList.add('show');
-    }, 2500);
-    
-    // Register service worker
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').catch(() => {});
-    }
-    
-    console.log('App ready!');
-  } catch (err) {
-    console.error('Init error:', err);
-    showToast('Failed to initialize', 'error');
+function updateAPIIndicator() {
+  const indicator = document.querySelector('.api-indicator');
+  if (App.settings.apiEnabled) {
+    indicator.classList.remove('off');
+    indicator.classList.add('on');
+  } else {
+    indicator.classList.remove('on');
+    indicator.classList.add('off');
   }
 }
 
-// Start
+// ============================================
+// INITIALIZATION
+// ============================================
+async function init() {
+  console.log('🚀 Expiry Tracker v' + CONFIG.VERSION + ' starting...');
+
+  try {
+    // Initialize database
+    await DB.init();
+
+    // Load settings
+    App.settings.apiEnabled = await DB.getSetting('apiEnabled', true);
+    document.getElementById('toggleAPI').checked = App.settings.apiEnabled;
+    updateAPIIndicator();
+
+    // Build master index
+    await refreshMasterCount();
+
+    // Refresh UI
+    await refreshUI();
+
+    // Setup events
+    setupEvents();
+
+    // Hide splash, show app
+    setTimeout(() => {
+      document.getElementById('splash').classList.add('hidden');
+      document.getElementById('app').classList.add('visible');
+
+      // Focus input
+      setTimeout(() => {
+        document.getElementById('inputBarcode').focus();
+      }, 100);
+    }, 2500);
+
+    // Register service worker
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js')
+        .then(() => console.log('✅ Service Worker registered'))
+        .catch(e => console.log('SW registration failed:', e));
+    }
+
+    console.log('✅ App ready!');
+  } catch (e) {
+    console.error('Init error:', e);
+    toast('Failed to initialize app', 'error');
+
+    // Still show app
+    document.getElementById('splash').classList.add('hidden');
+    document.getElementById('app').classList.add('visible');
+  }
+}
+
+// Start app
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', init);
 } else {
